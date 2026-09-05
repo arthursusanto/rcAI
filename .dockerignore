@@ -1,0 +1,13 @@
+# Build context for deploy/Dockerfile is the repo root, so this file lives here.
+# artifacts/ is deliberately NOT ignored: deploy/Dockerfile copies the model out of it.
+.git/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+data/
+mlruns/
+docs/
+tests/

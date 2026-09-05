@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.parquet binary
+
+# Kept out of the public snapshot (git archive drops these).
+docs/PLAN.md export-ignore
+docs/RESULTS.md export-ignore

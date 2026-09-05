@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rca incident console</title>
+<style>
+/* No transitions or animations anywhere: this has to work with OS motion disabled. */
+:root {
+  --bg: #14161a; --panel: #1c1f26; --line: #2b2f38; --text: #e6e8ec; --dim: #9aa1ad;
+  --ok: #4ea36b; --warn: #d8a33a; --bad: #d95757; --accent: #5b8def;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45
+  ui-monospace, "Cascadia Mono", "Consolas", monospace; }
+h1 { font-size: 15px; margin: 0; font-weight: 600; }
+h2 { font-size: 12px; margin: 0 0 8px; color: var(--dim); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .06em; }
+h3 { font-size: 12px; margin: 12px 0 4px; color: var(--dim); font-weight: 600; }
+a { color: var(--accent); }
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.pill { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line);
+  color: var(--dim); }
+.pill.ready { color: var(--ok); border-color: var(--ok); }
+.pill.warm { color: var(--warn); border-color: var(--warn); }
+.pill.alarm { color: var(--bad); border-color: var(--bad); }
+main { display: grid; grid-template-columns: minmax(420px, 1.15fr) minmax(360px, 1fr);
+  gap: 12px; padding: 12px; align-items: start; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 12px; }
+.stack > * + * { margin-top: 12px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line);
+  vertical-align: top; }
+th { color: var(--dim); font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--dim); }
+.bar { height: 8px; background: #262a33; border-radius: 4px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.tabs button { font: inherit; color: var(--text); background: #262a33; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 4px; padding: 3px 9px; }
+.tabs button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.scroll { max-height: 230px; overflow: auto; }
+.sev-ERROR, .sev-FATAL { color: var(--bad); }
+.sev-WARN { color: var(--warn); }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--dim); margin-top: 6px; }
+.swatch { display: inline-block; width: 10px; height: 10px; vertical-align: -1px;
+  margin-right: 4px; border: 1px solid var(--line); }
+svg text { fill: var(--dim); font-size: 10px; }
+.node { cursor: pointer; }
+.node.selected { stroke: var(--accent); stroke-width: 2; }
+code { color: var(--dim); word-break: break-all; }
+</style>
+</head>
+<body>
+<header>
+  <h1>rca incident console</h1>
+  <span id="status" class="pill">connecting</span>
+  <span id="mode" class="pill">-</span>
+  <span class="muted" id="clock">-</span>
+  <span class="muted" id="latency">-</span>
+  <span class="muted" id="model">-</span>
+</header>
+
+<main>
+  <div class="stack">
+    <section>
+      <h2>detection timeline</h2>
+      <svg id="timeline" viewBox="0 0 720 190" width="100%" height="190"
+           preserveAspectRatio="none" role="img" aria-label="detection probability"></svg>
+      <div class="legend">
+        <span><span class="swatch" style="background:#5b8def"></span>detection probability</span>
+        <span><span class="swatch" style="background:#d95757"></span>above threshold</span>
+        <span><span class="swatch" style="background:#7a5a2a"></span>ground-truth fault (label, not a prediction)</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>current incident</h2>
+      <div id="incident">no incident</div>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section>
+      <h2>evidence</h2>
+      <div class="tabs" id="service-tabs"></div>
+      <div id="evidence" class="muted">no evidence yet</div>
+    </section>
+
+    <section>
+      <h2>dependency graph</h2>
+      <svg id="graph" viewBox="0 0 720 320" width="100%" height="320" role="img"
+           aria-label="service dependency graph"></svg>
+      <p class="muted">Node fill and size are the current root score; the ranked services
+         can be clicked to load their evidence.</p>
+    </section>
+  </div>
+</main>
+
+<script>
+"use strict";
+const SVG = "http://www.w3.org/2000/svg";
+let selectedService = null;
+let selectedIsPinned = false;
+// Evidence is assembled for the ranked top services only, so nothing else is selectable.
+let evidenceServices = new Set();
+
+const $ = (id) => document.getElementById(id);
+const fmt = (v, n = 3) => (v === null || v === undefined || Number.isNaN(v)) ? "-" : Number(v).toFixed(n);
+const pct = (v) => (v === null || v === undefined) ? "-" : (100 * v).toFixed(1) + "%";
+const clock = (ns) => ns ? new Date(Number(ns) / 1e6).toISOString().slice(11, 19) : "-";
+
+async function getJSON(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error(url + " -> " + response.status);
+  return response.json();
+}
+
+function el(tag, attrs, text) {
+  const node = document.createElementNS(SVG, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function esc(value) {
+  return String(value === null || value === undefined ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// --- header --------------------------------------------------------------------------
+function renderState(state) {
+  const status = $("status");
+  status.textContent = state.error ? "error" : (state.status || "idle");
+  status.className = "pill " + (state.error ? "alarm" : state.ready ? "ready" : "warm");
+  $("mode").textContent = state.mode + (state.finished ? " (finished)" : "");
+  const warm = state.ready ? "" : "  warm-up " + fmt(state.warmup_remaining_s, 0) + "s left";
+  $("clock").textContent = "window " + (state.last_window_idx ?? "-") +
+    " @ " + clock(state.last_window_end_ns) + warm;
+  const total = state.latency && state.latency.total_ms;
+  $("latency").textContent = total
+    ? "latency p50 " + fmt(total.p50, 1) + " ms / p95 " + fmt(total.p95, 1) +
+      " ms over " + state.latency.n + " windows"
+    : "latency -";
+  $("model").textContent = (state.model_name || "") +
+    (state.detect_threshold != null ? "  threshold " + fmt(state.detect_threshold) : "");
+}
+
+// --- timeline ------------------------------------------------------------------------
+function renderTimeline(windows, truth, threshold) {
+  const svg = $("timeline");
+  svg.replaceChildren();
+  const W = 720, H = 190, pad = { l: 34, r: 8, t: 10, b: 20 };
+  if (!windows.length) {
+    svg.appendChild(el("text", { x: 10, y: 20 }, "waiting for the first scored window"));
+    return;
+  }
+  const t0 = Number(windows[0].window_start_ns);
+  const t1 = Math.max(Number(windows[windows.length - 1].window_end_ns), t0 + 1);
+  const x = (ns) => pad.l + (Number(ns) - t0) / (t1 - t0) * (W - pad.l - pad.r);
+  const y = (p) => pad.t + (1 - p) * (H - pad.t - pad.b);
+
+  for (const fault of (truth.faults || [])) {
+    const x0 = x(Math.max(fault.start_ns, t0)), x1 = x(Math.min(fault.end_ns, t1));
+    if (x1 <= pad.l || x0 >= W - pad.r) continue;
+    svg.appendChild(el("rect", { x: x0, y: pad.t, width: Math.max(x1 - x0, 1),
+      height: H - pad.t - pad.b, fill: "#7a5a2a", "fill-opacity": "0.35" }));
+    svg.appendChild(el("text", { x: x0 + 4, y: pad.t + 12 },
+      "ground truth: " + fault.fault_type + " @ " + fault.target));
+  }
+  for (const p of [0, 0.5, 1]) {
+    svg.appendChild(el("line", { x1: pad.l, x2: W - pad.r, y1: y(p), y2: y(p),
+      stroke: "#2b2f38" }));
+    svg.appendChild(el("text", { x: 4, y: y(p) + 3 }, p.toFixed(1)));
+  }
+  if (threshold != null) {
+    svg.appendChild(el("line", { x1: pad.l, x2: W - pad.r, y1: y(threshold),
+      y2: y(threshold), stroke: "#d95757", "stroke-dasharray": "4 3" }));
+  }
+  const points = windows.map((w) => x(w.window_start_ns) + "," + y(w.detect_prob)).join(" ");
+  svg.appendChild(el("polyline", { points, fill: "none", stroke: "#5b8def",
+    "stroke-width": "1.5" }));
+  for (const w of windows) {
+    svg.appendChild(el("circle", { cx: x(w.window_start_ns), cy: y(w.detect_prob), r: 2.2,
+      fill: w.detect ? "#d95757" : "#5b8def" }));
+  }
+  svg.appendChild(el("text", { x: pad.l, y: H - 6 }, clock(t0)));
+  svg.appendChild(el("text", { x: W - pad.r - 52, y: H - 6 }, clock(t1)));
+}
+
+// --- incident card -------------------------------------------------------------------
+function renderIncident(incident) {
+  const box = $("incident");
+  if (!incident) {
+    box.className = "muted";
+    box.textContent = "no incident detected";
+    return;
+  }
+  box.className = "";
+  const ranking = incident.ranking || [];
+  const probs = Object.entries(incident.fault_type_probs || {})
+    .sort((a, b) => b[1] - a[1]).slice(0, 4);
+  const rows = ranking.map((r, i) => `
+    <tr><td>${i + 1}</td><td>${esc(r.service)}</td>
+    <td class="num">${pct(r.score)}</td>
+    <td style="width:40%"><span class="bar"><i style="width:${Math.max(0, Math.min(100, 100 * r.score))}%"></i></span></td></tr>`).join("");
+  box.innerHTML = `
+    <p><b>${esc(incident.incident_id)}</b> ${incident.is_open ? "open" : "closed"} ·
+      opened ${clock(incident.opened_ns)}
+      ${incident.closed_ns ? "· closed " + clock(incident.closed_ns) : ""}
+      · ${incident.n_windows} windows</p>
+    <p>detection confidence <b>${pct(incident.detect_prob)}</b> ·
+       fault <b>${esc(incident.fault_type_pred)}</b> (${pct(incident.fault_type_conf)}) ·
+       top-1/top-2 margin <b>${fmt(incident.root_margin)}</b></p>
+    <h3>root ranking</h3>
+    <table><thead><tr><th>#</th><th>service</th><th class="num">P(root)</th><th></th></tr></thead>
+    <tbody>${rows}</tbody></table>
+    <h3>fault type</h3>
+    <table><tbody>${probs.map(([k, v]) =>
+      `<tr><td>${esc(k)}</td><td class="num">${pct(v)}</td>
+       <td style="width:55%"><span class="bar"><i style="width:${100 * v}%"></i></span></td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+// --- evidence ------------------------------------------------------------------------
+function renderTabs(incident) {
+  const tabs = $("service-tabs");
+  tabs.replaceChildren();
+  const services = Object.keys((incident && incident.evidence) || {});
+  evidenceServices = new Set(services);
+  if (!services.length) return;
+  if (!selectedIsPinned || !services.includes(selectedService)) {
+    selectedService = services[0];
+    selectedIsPinned = false;
+  }
+  for (const service of services) {
+    const button = document.createElement("button");
+    button.textContent = service;
+    button.setAttribute("aria-pressed", String(service === selectedService));
+    button.addEventListener("click", () => {
+      selectedService = service;
+      selectedIsPinned = true;
+      refresh();
+    });
+    tabs.appendChild(button);
+  }
+}
+
+function traceLink(links, traceId) {
+  const template = links && links.templates && links.templates.trace;
+  if (!template) return esc(traceId);
+  const url = template.replace("{trace_id}", encodeURIComponent(traceId));
+  return `<a href="${esc(url)}" target="_blank" rel="noreferrer"><code>${esc(traceId.slice(0, 16))}</code></a>`;
+}
+
+function spanRows(spans, links) {
+  if (!spans.length) return `<tr><td colspan="4" class="muted">none</td></tr>`;
+  return spans.map((s) => `<tr>
+    <td>${esc(s.operation)}${s.peer ? " &rarr; " + esc(s.peer) : ""}</td>
+    <td class="num">${fmt(s.duration_ms, 1)}</td>
+    <td>${s.status_error ? '<span class="sev-ERROR">error</span>' : "ok"}</td>
+    <td>${traceLink(links, s.trace_id)}</td></tr>`).join("");
+}
+
+function renderEvidence(incident) {
+  const box = $("evidence");
+  const evidence = incident && incident.evidence && incident.evidence[selectedService];
+  if (!evidence) {
+    box.className = "muted";
+    box.textContent = "no evidence for the selected window";
+    return;
+  }
+  box.className = "";
+  const links = incident.links || {};
+  const metrics = Object.entries(evidence.metrics || {}).map(([name, m]) => `
+    <tr><td>${esc(name)}</td><td class="num">${fmt(m.value, 3)}</td>
+    <td class="num">${m.z === null ? "-" : fmt(m.z, 1)}</td></tr>`).join("");
+  const logs = (evidence.logs || []).map((l) => `<tr>
+    <td class="sev-${esc(l.severity)}">${esc(l.severity)}</td>
+    <td>${esc(l.body)}</td>
+    <td>${l.trace_id ? traceLink(links, l.trace_id) : ""}</td></tr>`).join("")
+    || `<tr><td colspan="3" class="muted">no ERROR/WARN lines</td></tr>`;
+  const external = links.service === selectedService ? `
+    <p><a href="${esc(links.jaeger_service)}" target="_blank" rel="noreferrer">traces in Jaeger</a> ·
+       <a href="${esc(links.grafana_metrics)}" target="_blank" rel="noreferrer">metrics in Grafana</a> ·
+       <a href="${esc(links.grafana_logs)}" target="_blank" rel="noreferrer">logs in Grafana</a></p>` : "";
+  box.innerHTML = `
+    <p><b>${esc(selectedService)}</b> · ${evidence.spans.n_spans} spans,
+       ${evidence.spans.n_errors} errored</p>
+    ${external}
+    <h3>key metrics (value / robust z)</h3>
+    <table><thead><tr><th>metric</th><th class="num">value</th><th class="num">z</th></tr></thead>
+    <tbody>${metrics}</tbody></table>
+    <h3>error spans</h3>
+    <div class="scroll"><table><thead><tr><th>operation</th><th class="num">ms</th>
+      <th>status</th><th>trace</th></tr></thead>
+      <tbody>${spanRows(evidence.spans.error, links)}</tbody></table></div>
+    <h3>slowest spans</h3>
+    <div class="scroll"><table><thead><tr><th>operation</th><th class="num">ms</th>
+      <th>status</th><th>trace</th></tr></thead>
+      <tbody>${spanRows(evidence.spans.slow, links)}</tbody></table></div>
+    <h3>logs</h3>
+    <div class="scroll"><table><tbody>${logs}</tbody></table></div>`;
+}
+
+// --- dependency graph ----------------------------------------------------------------
+function renderGraph(topology) {
+  const svg = $("graph");
+  svg.replaceChildren();
+  const services = topology.services || [];
+  if (!services.length) return;
+  const edges = topology.edges || [];
+  const scores = topology.scores || {};
+
+  const called = new Set(edges.map(([, t]) => t));
+  const depth = new Map(services.filter((s) => !called.has(s)).map((s) => [s, 0]));
+  let frontier = [...depth.keys()];
+  while (frontier.length) {
+    const next = [];
+    for (const service of frontier) {
+      for (const [from, to] of edges) {
+        if (from === service && !depth.has(to)) { depth.set(to, depth.get(service) + 1); next.push(to); }
+      }
+    }
+    frontier = next;
+  }
+  for (const service of services) if (!depth.has(service)) depth.set(service, 0);
+
+  const columns = new Map();
+  for (const service of services) {
+    const d = depth.get(service);
+    if (!columns.has(d)) columns.set(d, []);
+    columns.get(d).push(service);
+  }
+  const width = 720, height = 320;
+  const depths = [...columns.keys()].sort((a, b) => a - b);
+  const position = new Map();
+  depths.forEach((d, i) => {
+    const column = columns.get(d);
+    column.forEach((service, j) => position.set(service, {
+      x: 60 + i * (width - 120) / Math.max(depths.length - 1, 1),
+      y: 26 + (j + 0.5) * (height - 52) / column.length,
+    }));
+  });
+
+  for (const [from, to] of edges) {
+    const a = position.get(from), b = position.get(to);
+    if (a && b) svg.appendChild(el("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+      stroke: "#2b2f38" }));
+  }
+  for (const service of services) {
+    const p = position.get(service);
+    const score = Math.max(0, Math.min(1, scores[service] ?? 0));
+    const node = el("circle", {
+      cx: p.x, cy: p.y, r: 7 + 6 * score,
+      fill: `rgb(${Math.round(40 + 190 * score)},${Math.round(60 - 20 * score)},${Math.round(70 - 20 * score)})`,
+      stroke: "#3a3f4a",
+    });
+    const selectable = evidenceServices.has(service);
+    node.setAttribute("class", (selectable ? "node" : "") +
+      (service === selectedService ? " selected" : ""));
+    if (selectable) {
+      node.addEventListener("click", () => {
+        selectedService = service;
+        selectedIsPinned = true;
+        refresh();
+      });
+    }
+    node.appendChild(el("title", {}, `${service}  P(root)=${fmt(scores[service] ?? 0)}` +
+      (selectable ? "  (click for evidence)" : "")));
+    svg.appendChild(node);
+    svg.appendChild(el("text", { x: p.x + 12 + 6 * score, y: p.y + 3 }, service));
+  }
+}
+
+// --- polling -------------------------------------------------------------------------
+async function refresh() {
+  try {
+    const [state, recent, list, truth, topology] = await Promise.all([
+      getJSON("/state"), getJSON("/windows/recent?n=400"), getJSON("/incidents"),
+      getJSON("/replay/ground-truth"), getJSON("/services"),
+    ]);
+    renderState(state);
+    renderTimeline(recent.windows || [], truth || {}, state.detect_threshold);
+    const summary = (list.incidents || [])[0] || null;
+    const incident = summary ? await getJSON("/incidents/" + summary.incident_id) : null;
+    renderIncident(incident);
+    renderTabs(incident);
+    renderEvidence(incident);
+    renderGraph(topology);
+  } catch (err) {
+    $("status").textContent = "unreachable";
+    $("status").className = "pill alarm";
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

@@ -1,0 +1,73 @@
+# RCA benchmark override for the OpenTelemetry Demo compose stack.
+#
+# Copy to the root of a demo checkout and pass it explicitly as the LAST -f, e.g.
+#   docker compose -f compose.yaml -f compose.full.yaml -f docker-compose.override.yml up -d
+#
+# compose.full.yaml is REQUIRED: accounting, fraud-detection and kafka only exist in
+# that layer, and all three are part of the RCA label space. This file patches those
+# services, so running without compose.full.yaml would make Compose try to create them
+# from scratch and fail with "no image or build context specified".
+#
+# What it does:
+#   1. Mounts a host directory into the collector at /capture, which is where
+#      deploy/compose/otelcol-config-extras.yml points its three file exporters.
+#      Compose merges `volumes` by target path, so the demo's own collector mounts
+#      (/hostfs, /var/run/docker.sock, the config files) are preserved.
+#      The collector container already runs as `user: 0:0`, so it can write there.
+#   2. Gives every one of the 15 application services a baseline limit of exactly one
+#      CPU. The demo sets none, so without this `container.cpu.limit` is absent and
+#      ingest normalises cpu_util by the host's logical core count -- until a
+#      cpu_saturation fault sets a quota, at which point the denominator steps to the
+#      quota. That step is a fault-correlated artefact a model would learn instead of
+#      the signal. A constant 1.0 CPU makes the denominator constant across baseline
+#      and fault windows (the injector's clear restores exactly this value).
+#      `deploy.resources.limits.cpus` is what Compose maps to HostConfig.NanoCpus, the
+#      same field `docker update --cpus` writes, so the two agree; it deep-merges with
+#      the demo's own `deploy.resources.limits.memory`.
+#   3. Adds NET_ADMIN to every container the fault injector can target with
+#      `tc qdisc ... netem`. NOTE: none of the demo images actually ship `tc`
+#      (they are distroless, alpine or slim bases), so the injector's default
+#      netem_mode is "sidecar": it runs a throwaway container with
+#      `--network container:<target> --cap-add NET_ADMIN` instead of exec'ing into
+#      the target. NET_ADMIN here only matters for netem_mode="exec", which needs
+#      images rebuilt with iproute2. It is harmless otherwise.
+
+# Applied to the 15 application services (the RCA label space).
+x-rca-service: &rca-service
+  cap_add: [NET_ADMIN]
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+
+services:
+  otel-collector:
+    volumes:
+      - ${RCA_CAPTURE_DIR:-./rca-capture}:/capture
+
+  # --- application services (the 15 root-cause labels) ---
+  ad: *rca-service
+  cart: *rca-service
+  checkout: *rca-service
+  currency: *rca-service
+  email: *rca-service
+  frontend: *rca-service
+  frontend-proxy: *rca-service
+  image-provider: *rca-service
+  payment: *rca-service
+  product-catalog: *rca-service
+  quote: *rca-service
+  recommendation: *rca-service
+  shipping: *rca-service
+  accounting: *rca-service
+  fraud-detection: *rca-service
+
+  # --- infra containers used as fault mechanisms (cache_slowdown, queue_backlog) ---
+  # netem targets only: no CPU limit, they are never a cpu_saturation target and are
+  # not part of the label space.
+  valkey-cart:
+    cap_add: [NET_ADMIN]
+  astronomy-db:
+    cap_add: [NET_ADMIN]
+  kafka:
+    cap_add: [NET_ADMIN]

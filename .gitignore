@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+/data/
+mlruns/
+artifacts/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+/bench/

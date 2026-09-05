@@ -1,0 +1,71 @@
+# OpenTelemetry Collector extras layer for RCA benchmark capture.
+#
+# Copy over the demo's src/otel-collector/otelcol-config-extras.yml. The demo always
+# loads that file last (compose.yaml passes --config=/etc/otelcol-config-extras.yml
+# after the base config), which is the documented seam for customization.
+#
+# The collector MERGES maps but REPLACES arrays. Every array below is therefore a
+# full replacement of the upstream value, not an addition:
+#   * service.pipelines.<signal>.exporters -- upstream base config has
+#       traces:  [debug, span_metrics]
+#       metrics: [debug]
+#       logs:    [debug]
+#     (source: src/otel-collector/otelcol-config.yml). Those names are repeated below.
+#     If you also run compose.observability.yaml, add its exporters back by hand:
+#       traces: otlp_grpc/jaeger, metrics: otlp_http/prometheus, logs: opensearch.
+#     The benchmark deliberately runs WITHOUT the observability stack so Jaeger /
+#     Prometheus / OpenSearch do not compete for CPU with the services under test.
+#   * receivers arrays are NOT touched here, so the upstream metrics receiver list
+#     (docker_stats, host_metrics, otlp, redis, postgresql, nginx, http_check,
+#     span_metrics, prometheus/ad, and kafkametrics when compose.full.yaml is used)
+#     stays intact.
+#
+# docker_stats and host_metrics are already receivers in the demo's base config, so
+# per-container cpu/memory/network is available out of the box. The map merge below
+# only tightens the scrape interval and enables the extra per-container metrics the
+# canonical schema wants (pids -> threads, cpu limit for normalising cpu_util).
+
+receivers:
+  docker_stats:
+    collection_interval: 5s
+    metrics:
+      container.cpu.limit:
+        enabled: true
+      container.cpu.logical.count:
+        enabled: true
+      container.pids.count:
+        enabled: true
+      container.memory.usage.limit:
+        enabled: true
+      container.restarts:
+        enabled: true
+
+exporters:
+  # One file per signal, OTLP-JSON, one JSON object per line.
+  # append: true keeps the file across collector restarts; the file exporter only
+  # rotates when a `rotation:` block is present, so rotation is off here (and
+  # `append: true` is incompatible with rotation anyway).
+  file/rca_traces:
+    path: /capture/traces.jsonl
+    format: json
+    append: true
+    flush_interval: 1s
+  file/rca_metrics:
+    path: /capture/metrics.jsonl
+    format: json
+    append: true
+    flush_interval: 1s
+  file/rca_logs:
+    path: /capture/logs.jsonl
+    format: json
+    append: true
+    flush_interval: 1s
+
+service:
+  pipelines:
+    traces:
+      exporters: [debug, span_metrics, file/rca_traces]
+    metrics:
+      exporters: [debug, file/rca_metrics]
+    logs:
+      exporters: [debug, file/rca_logs]

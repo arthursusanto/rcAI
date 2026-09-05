@@ -1,0 +1,185 @@
+# Helm values override for the OpenTelemetry Demo chart, RCA benchmark flavour.
+#
+# Verified against chart `opentelemetry-demo` 0.41.0 (appVersion 3.0.0 -- the same demo
+# version deploy/compose targets) and its `opentelemetry-collector` 0.165.0 subchart.
+# Every key below was read out of that chart's values.yaml and templates; the citation
+# is on the block that uses it.
+#
+#   helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+#   kubectl apply -f deploy/k8s/rca-serve.yaml     # creates the rca-capture PVC
+#   helm install rca-demo open-telemetry/opentelemetry-demo \
+#       --version 0.41.0 -f deploy/k8s/values-demo.yaml
+#
+# See deploy/k8s/README.md for the full quickstart and for how fault injection differs
+# from the compose path.
+
+# ---------------------------------------------------------------------------------------
+# Collector: the same three file exporters deploy/compose/otelcol-config-extras.yml adds,
+# writing into a PVC that the rca inference server mounts read-only.
+# ---------------------------------------------------------------------------------------
+opentelemetry-collector:
+  # `securityContext` in the collector subchart is the CONTAINER security context:
+  # charts/opentelemetry-collector/templates/_pod.tpl renders `.Values.securityContext`
+  # under containers[0]. Root mirrors the compose stack, where the collector runs as
+  # `user: 0:0` precisely so it can write the capture files. Safe to drop if your
+  # provisioner creates the volume world-writable (rancher local-path does: it mkdirs
+  # the backing directory with mode 0777).
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+
+  # `extraVolumes` / `extraVolumeMounts` are documented keys of the collector subchart
+  # (its values.yaml, "This also supports template content") and are rendered by its
+  # _pod.tpl. The PVC itself is NOT created here -- Helm values cannot create arbitrary
+  # objects -- it comes from deploy/k8s/rca-serve.yaml and must exist before install.
+  extraVolumes:
+    - name: rca-capture
+      persistentVolumeClaim:
+        claimName: rca-capture
+  extraVolumeMounts:
+    - name: rca-capture
+      mountPath: /capture
+
+  config:
+    # Identical to deploy/compose/otelcol-config-extras.yml: one file per signal,
+    # OTLP-JSON, one JSON object per line, append-only, no rotation (`append: true` is
+    # incompatible with a `rotation:` block, so the files grow for the whole campaign
+    # and each experiment is a [start_ns, end_ns] window inside them).
+    exporters:
+      file/rca_traces:
+        path: /capture/traces.jsonl
+        format: json
+        append: true
+        flush_interval: 1s
+      file/rca_metrics:
+        path: /capture/metrics.jsonl
+        format: json
+        append: true
+        flush_interval: 1s
+      file/rca_logs:
+        path: /capture/logs.jsonl
+        format: json
+        append: true
+        flush_interval: 1s
+
+    service:
+      pipelines:
+        # Helm coalesces maps but REPLACES lists, so each list here is a full
+        # replacement of the chart's own value, not an addition. The names repeated
+        # below are the chart's defaults (values.yaml, `opentelemetry-collector.config.
+        # service.pipelines`): traces [otlp_grpc/jaeger, debug, span_metrics],
+        # metrics [otlp_http/prometheus, debug], logs [opensearch, debug].
+        #
+        # Unlike the compose benchmark, the Kubernetes chart enables Jaeger, Prometheus,
+        # Grafana and OpenSearch by default, and they stay enabled here so the incident
+        # UI's evidence links resolve. That costs CPU the services under test would
+        # otherwise have; set `jaeger.enabled` / `prometheus.enabled` / `grafana.enabled`
+        # / `opensearch.enabled` to false and drop their exporters from these lists to
+        # get the compose-equivalent lean stack.
+        #
+        # `receivers` is deliberately not touched: the chart sets
+        # metrics.receivers = [otlp, kafkametrics, span_metrics, prometheus/ad] and the
+        # collector chart's presets append kubeletstats / hostmetrics / k8s_cluster to it
+        # (charts/opentelemetry-collector/templates/_config.tpl).
+        traces:
+          exporters: [otlp_grpc/jaeger, debug, span_metrics, file/rca_traces]
+        metrics:
+          exporters: [otlp_http/prometheus, debug, file/rca_metrics]
+        logs:
+          exporters: [opensearch, debug, file/rca_logs]
+
+  # NOTE: the compose extras file also tightens the `docker_stats` receiver (5 s
+  # interval, cpu limit, pids count). There is no docker_stats receiver in Kubernetes.
+  # Per-container resource metrics come from the chart's `kubeletMetrics` preset
+  # (kubeletstats receiver) instead, under different metric names and with
+  # `k8s.container.name` rather than `container.name` as the identifying resource
+  # attribute. rca/benchmark/ingest.py:METRIC_MAP maps only the docker_stats names, so
+  # resource metrics from a Kubernetes capture will NOT be ingested until that map grows
+  # a kubeletstats branch. Traces and logs ingest unchanged. See README.
+
+# ---------------------------------------------------------------------------------------
+# Components: NET_ADMIN so `tc netem` works, and the components the RCA label space needs.
+# ---------------------------------------------------------------------------------------
+components:
+  # `components.<name>.securityContext` is the CONTAINER security context
+  # (templates/_objects.tpl renders it under the component's container), so
+  # `capabilities.add` lands in the right place. Helm merges it with the securityContext
+  # the chart already sets on some components (shipping's readOnlyRootFilesystem,
+  # kafka's and frontend's runAsUser).
+  #
+  # As in compose, no demo image ships `tc` -- they are distroless, alpine or slim -- so
+  # this capability only matters if you rebuild an image with iproute2 and exec into it.
+  # The practical netem path in Kubernetes is an ephemeral debug container started with
+  # `kubectl debug --profile=netadmin`, which carries its own NET_ADMIN; see README.
+
+  # --- the 15 application services (the root-cause label space) ---
+  # accounting, fraud-detection and kafka only exist in compose.full.yaml on the compose
+  # path; in the chart they are ordinary components, on by default. `enabled: true` is
+  # pinned on those three so a future chart default cannot silently remove three members
+  # of the RCA label space -- see the note on kafka below.
+  accounting:
+    enabled: true
+    securityContext: &netadmin
+      capabilities:
+        add: [NET_ADMIN]
+  ad:
+    securityContext: *netadmin
+  cart:
+    securityContext: *netadmin
+  checkout:
+    securityContext: *netadmin
+  currency:
+    securityContext: *netadmin
+  email:
+    securityContext: *netadmin
+  fraud-detection:
+    enabled: true
+    securityContext: *netadmin
+  frontend:
+    securityContext: *netadmin
+  frontend-proxy:
+    securityContext: *netadmin
+  image-provider:
+    securityContext: *netadmin
+  payment:
+    securityContext: *netadmin
+  product-catalog:
+    securityContext: *netadmin
+  quote:
+    securityContext: *netadmin
+  recommendation:
+    securityContext: *netadmin
+  shipping:
+    securityContext: *netadmin
+
+  # --- infra containers used as fault mechanisms (cache_slowdown, queue_backlog) ---
+  valkey-cart:
+    securityContext: *netadmin
+  astronomy-db:
+    securityContext: *netadmin
+
+  # CORRECTION to the compose model: the chart has NO full/optional-components flag.
+  # compose.full.yaml has no Helm equivalent -- every component is gated individually by
+  # `components.<name>.enabled`, and all of them are already `true` in the chart's
+  # values.yaml except `firepit`. kafka, accounting and fraud-detection are therefore on
+  # by default, and the `enabled: true` lines here and above only pin that.
+  kafka:
+    enabled: true
+    securityContext: *netadmin
+
+  # --- components outside the RCA label space --------------------------------------
+  # `agent`, `chatbot` and `mcp` are the demo's LLM services; `telemetry-docs` and
+  # `opamp-server` are support UIs. All are enabled by default and add roughly 1.5 GiB
+  # of memory limits. rca/benchmark/ingest.py drops telemetry from services outside
+  # KNOWN_SERVICES, so leaving them on is harmless for the data -- it only costs laptop
+  # resources. Uncomment to trim the stack:
+  # agent:
+  #   enabled: false
+  # chatbot:
+  #   enabled: false
+  # mcp:
+  #   enabled: false
+  # telemetry-docs:
+  #   enabled: false
+  # opamp-server:
+  #   enabled: false
